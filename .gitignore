@@ -15,6 +15,9 @@ FantasyDaily.html
 *_roster.json
 output/
 
+# Scheduled-run logs (contain local machine paths)
+logs/
+
 # Pulled/generated data (reproducible via the pull_*.py / build_*.py scripts)
 data/
 
