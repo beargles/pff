@@ -1,13 +1,12 @@
-# daily_status_check.ps1 -- runs daily Tue-Sun. Does NOT touch pull_weekly_stats.py
+﻿# daily_status_check.ps1 -- runs daily Tue-Sun. Does NOT touch pull_weekly_stats.py
 # (that's auto_weekly.ps1's job, once, on Tuesday) -- this script only re-pulls
 # THIS week's DK salaries (once the draft group ID is known) and reports what
 # changed since yesterday's pull: Status (O/Q/D/etc.) and DraftAlerts changes.
 #
-# Skips cleanly, doing nothing, until data\current_draft_group.json exists for
-# the current week -- that file is written automatically the first time
-# pull_dk_salaries.py or weekly_update.ps1 is run with --season/--week for the
-# week (i.e. as soon as Jake pastes this week's curl and Claude runs the pull).
-# No re-pasting needed on later days -- this script reuses the same ID.
+# Draft group ID: reuses data\current_draft_group.json if it's for the current
+# week; otherwise auto-detects the week's full Thu-Mon Classic slate with
+# find_dk_draft_group.py (no curl pasting needed). Skips cleanly if DK hasn't
+# posted the week's slates yet, and retries on the next run.
 
 $ErrorActionPreference = "Stop"
 
@@ -44,19 +43,29 @@ if ($null -eq $cal.week) {
 $Week = [int]$cal.week
 
 $statePath = Join-Path $root "data\current_draft_group.json"
-if (-not (Test-Path $statePath)) {
-    Log "No draft group ID on record yet for any week (data\current_draft_group.json missing) -- skipping. Nothing to re-pull until Jake pastes this week's curl."
-    exit 0
+$draftGroupId = $null
+if (Test-Path $statePath) {
+    $state = Get-Content $statePath -Raw | ConvertFrom-Json
+    if ([int]$state.week -eq $Week) {
+        $draftGroupId = $state.draft_group_id
+        Log "Using known draft group ID $draftGroupId for Week $Week (recorded $($state.updated_at))"
+    } else {
+        Log "Draft group ID on record is for Week $($state.week), current week is $Week -- auto-detecting this week's."
+    }
 }
-
-$state = Get-Content $statePath -Raw | ConvertFrom-Json
-if ([int]$state.week -ne $Week) {
-    Log "Draft group ID on record is for Week $($state.week), but current week is $Week -- skipping (stale ID, not yet updated for this week). Waiting on Jake's fresh curl."
-    exit 0
+if (-not $draftGroupId) {
+    # Continue (not Stop) so the finder's stderr "not found yet" note can't abort the script.
+    $ErrorActionPreference = "Continue"
+    $found = & $py "$root\scripts\find_dk_draft_group.py" 2>$null
+    $findExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($findExit -ne 0 -or -not $found) {
+        Log "Couldn't find a DK Classic draft group for Week $Week yet (DK may not have posted this week's slates) -- skipping, will retry next run."
+        exit 0
+    }
+    $draftGroupId = ([string]$found).Trim()
+    Log "Auto-detected Week $Week draft group ID $draftGroupId (full-week Classic slate)."
 }
-
-$draftGroupId = $state.draft_group_id
-Log "Using known draft group ID $draftGroupId for Week $Week (recorded $($state.updated_at))"
 
 $salariesPath = Join-Path $root "data\dk_salaries\DKSalaries_wk$Week.csv"
 Log "Re-pulling Week $Week salaries..."

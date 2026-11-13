@@ -1,4 +1,4 @@
-# auto_weekly.ps1 -- fully unattended half of the weekly Tinker Tinker pipeline.
+﻿# auto_weekly.ps1 -- fully unattended half of the weekly Tinker Tinker pipeline.
 #
 # Meant to be run on a schedule (see the one-time `schtasks` registration in
 # README.md / the setup instructions) via Windows Task Scheduler, NOT through
@@ -12,15 +12,12 @@
 # What it does automatically, no input needed:
 #   - Figures out the current NFL week from nfl_calendar.py
 #   - Pulls last week's real results (pull_weekly_stats.py)
-#   - If this week's DK salary file already exists, rebuilds projections +
-#     the dashboard
+#   - If this week's DK salary file is missing, auto-detects the week's
+#     draft group ID (find_dk_draft_group.py) and pulls it
+#   - Rebuilds projections + the dashboard once the salary file exists
 #
-# What it can NOT do automatically (this is why Claude also set up a Tuesday
-# 6am reminder message separately): pull THIS week's DK salaries, because
-# that needs a fresh --draft-group-id you have to find on draftkings.com
-# each week. If that file isn't there yet, this script logs that and stops
-# cleanly -- rerun weekly_update.ps1 (or just pull_dk_salaries.py) once you
-# have the ID, and the dashboard will build then.
+# If DK hasn't posted the week's slates yet, it logs that and stops cleanly;
+# daily_status_check.ps1 retries the detection every morning after that.
 #
 # Logs to logs\auto_weekly.log (created if missing) so you can check what
 # happened on a run you weren't watching.
@@ -84,6 +81,20 @@ if ($PrevWeek -ge 1) {
 }
 
 $salariesPath = Join-Path $root "data\dk_salaries\DKSalaries_wk$Week.csv"
+if (-not (Test-Path $salariesPath)) {
+    Log "No salary file yet for Week $Week -- auto-detecting the DK draft group..."
+    # Continue (not Stop) so the finder's stderr "not found yet" note can't abort the script.
+    $ErrorActionPreference = "Continue"
+    $found = & $py "$root\scripts\find_dk_draft_group.py" 2>$null
+    $findExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($findExit -eq 0 -and $found) {
+        $draftGroupId = ([string]$found).Trim()
+        Log "Auto-detected draft group ID $draftGroupId -- pulling Week $Week salaries..."
+        & $py "$root\scripts\pull_dk_salaries.py" --draft-group-id $draftGroupId --out $salariesPath --season $Season --week $Week 2>&1 | ForEach-Object { Log "  $_" }
+        if ($LASTEXITCODE -ne 0) { Log "WARNING: pull_dk_salaries.py failed." }
+    }
+}
 if (-not (Test-Path $salariesPath)) {
     Log "No salary file yet for Week $Week ($salariesPath) -- can't build projections/dashboard until this week's DraftKings draft group ID is pulled. Stopping cleanly for this run."
     exit 0
