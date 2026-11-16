@@ -55,6 +55,10 @@ else {
     Write-Host "`n== Reusing existing $salariesPath (no -DraftGroupId passed) ==" -ForegroundColor Cyan
 }
 
+Write-Host "`n== Pulling ESPN rosters + nflverse snaps/targets (active-roster and punt checks) ==" -ForegroundColor Cyan
+& $py "$root\scripts\pull_espn_status.py" --season $Season --week $Week
+& $py "$root\scripts\pull_nflverse_usage.py" --season $Season
+
 Write-Host "`n== Building Week $Week projections ==" -ForegroundColor Cyan
 & $py "$root\scripts\build_projections.py" --season $Season --week $Week --salaries $salariesPath
 if ($LASTEXITCODE -ne 0) { Write-Error "build_projections.py failed -- stopping."; exit 1 }

@@ -36,6 +36,7 @@ def load_projections(path):
             opp_avg3_raw = row.get("OppPosAllowedAvg3", "")
             stddev_raw = row.get("StdDev", "")
             season_avg_raw = row.get("SeasonAvgDKPts", "")
+            upside_raw = row.get("Upside140", "")
             players.append({
                 "name": row["Name"], "team": row["Team"], "position": row["Position"],
                 "salary": int(row["Salary"]), "gameInfo": row.get("GameInfo", ""),
@@ -44,8 +45,14 @@ def load_projections(path):
                 "floor": float(floor_raw) if floor_raw not in (None, "") else None,
                 "stdDev": float(stddev_raw) if stddev_raw not in (None, "") else None,
                 "seasonAvgDKPts": float(season_avg_raw) if season_avg_raw not in (None, "") else None,
+                "upside140": float(upside_raw) if upside_raw not in (None, "") else None,
                 "status": row.get("Status", ""),
                 "draftAlerts": row.get("DraftAlerts", ""),
+                "rosterFlag": row.get("RosterFlag", ""),
+                "puntFail": row.get("PuntFail", ""),
+                "snapsLastWk": int(row["SnapsLastWk"]) if row.get("SnapsLastWk") not in (None, "") else None,
+                "targetsRecent": int(row["TargetsRecent"]) if row.get("TargetsRecent") not in (None, "") else None,
+                "heavy12": str(row.get("Heavy12", "")).strip().lower() == "true",
                 "matchupScore": int(matchup_raw) if matchup_raw not in (None, "") else None,
                 "matchupLabel": row.get("MatchupLabel", ""),
                 "games2026": int(games2026_raw) if games2026_raw not in (None, "") else 0,
@@ -198,6 +205,8 @@ def main():
     optimizer_lineups_ewma = run_optimizer(args.projections, args.lineups, metric="EwmaProjection")
     # "Safe" model: Floor + QB with 1 of his WR/TE -- the steadiest angle in the 2026 wk1-6 backtest.
     optimizer_lineups_safe = run_optimizer(args.projections, args.lineups, metric="Floor", stack=1)
+    # "Upside 140" model: 2-game 2026 EWMA + 1.5 SD, QB + 2 of his WR/TE (2026-11-04 backtest).
+    optimizer_lineups_upside = run_optimizer(args.projections, args.lineups, metric="Upside140", stack=2)
     history = load_history()
     saved_roster_names = load_saved_roster(args.season, args.week)
     gold_mine_alerts = load_gold_mine_alerts(args.week)
@@ -210,6 +219,7 @@ def main():
         "optimizerLineups": optimizer_lineups,
         "optimizerLineupsEwma": optimizer_lineups_ewma,
         "optimizerLineupsSafe": optimizer_lineups_safe,
+        "optimizerLineupsUpside": optimizer_lineups_upside,
         "history": history,
         "savedRosterNames": saved_roster_names,
         "rosterFileName": roster_path(args.season, args.week).name,
@@ -225,6 +235,7 @@ def main():
     print(f"({len(players)} players, {len(optimizer_lineups)} blend-model optimizer lineups, "
           f"{len(optimizer_lineups_ewma)} EWMA-model optimizer lineups, "
           f"{len(optimizer_lineups_safe)} safe (Floor + stack) optimizer lineups, "
+          f"{len(optimizer_lineups_upside)} upside-140 optimizer lineups, "
           f"{len(history)} history rows, {len(gold_mine_alerts)} gold-mine alerts baked in)")
 
 

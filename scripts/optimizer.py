@@ -34,10 +34,19 @@ FLEX_ELIGIBLE = {"RB", "WR", "TE"}
 FLEX_COUNT = 1
 
 
-def load_players(path, metric="Projection"):
+def load_players(path, metric="Projection", include_inactive=False):
     players = []
+    skipped = []
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
+            # RosterFlag (build_projections.py) = not on an active 53-man
+            # roster (practice squad / IR / released). Never draft them.
+            # PuntFail = a cheap RB/WR/TE with <= 10 snaps last game or no
+            # recent target. Same treatment.
+            if not include_inactive and ((row.get("RosterFlag") or "").strip()
+                                         or (row.get("PuntFail") or "").strip()):
+                skipped.append(row["Name"])
+                continue
             pos = row["Position"].strip().upper()
             # DK sometimes lists multi-position eligibility like "RB/FLEX" -- take the first token.
             pos = pos.split("/")[0]
@@ -47,6 +56,9 @@ def load_players(path, metric="Projection"):
                 # Floor (and EWMA) can be blank for players with no history.
                 "projection": float(row[metric]) if row.get(metric) not in (None, "") else 0.0,
             })
+    if skipped:
+        print(f"[note] skipped {len(skipped)} player(s) not on an active 53-man roster or failing "
+              f"the punt check (RosterFlag/PuntFail set; use --include-inactive to keep them).")
     return players
 
 
@@ -136,9 +148,13 @@ def main():
                           "e.g. 'Projection' (season blend, default), 'EwmaProjection' or 'Floor'")
     ap.add_argument("--stack", type=int, default=0,
                      help="require at least this many WR/TE from the QB's team (0 = off)")
+    ap.add_argument("--include-inactive", action="store_true",
+                     help="keep practice-squad/IR/released players (RosterFlag) and failed "
+                          "punts (PuntFail) in the pool")
     args = ap.parse_args()
 
-    players = load_players(args.projections, metric=args.metric)
+    players = load_players(args.projections, metric=args.metric,
+                           include_inactive=args.include_inactive)
 
     generated = []
     for n in range(1, args.lineups + 1):

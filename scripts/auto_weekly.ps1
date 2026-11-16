@@ -100,6 +100,10 @@ if (-not (Test-Path $salariesPath)) {
     exit 0
 }
 
+Log "Pulling ESPN rosters + nflverse snaps/targets (active-roster and punt checks, best-effort)..."
+& $py "$root\scripts\pull_espn_status.py" --season $Season --week $Week 2>&1 | ForEach-Object { Log "  $_" }
+& $py "$root\scripts\pull_nflverse_usage.py" --season $Season 2>&1 | ForEach-Object { Log "  $_" }
+
 Log "Building Week $Week projections..."
 & $py "$root\scripts\build_projections.py" --season $Season --week $Week --salaries $salariesPath 2>&1 | ForEach-Object { Log "  $_" }
 if ($LASTEXITCODE -ne 0) {

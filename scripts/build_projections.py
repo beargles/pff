@@ -60,6 +60,15 @@ RECENCY_WEIGHTS = [0.4, 0.3, 0.2, 0.1]
 # per-game projection (or DK's average) as a placeholder.
 EWMA_SPAN = 5
 
+# "Upside 140" model (see Upside140 below): short EWMA span + stdev bonus.
+UPSIDE_EWMA_SPAN = 2
+UPSIDE_SD_WEIGHT = 1.5
+
+# Whether load_history() blends in the prior season's games. Tested
+# 2026-11-04: dropping 2025 made Floor-based lineups ~10+ pts worse with only
+# 8 weeks of 2026 data, so it stays on for now. Set False for 2026-only.
+USE_PRIOR_SEASON = True
+
 # Standing strategy preference (see reference/dfs_strategy_notes.md): keep
 # fading these offenses -- whichever DST plays one of these teams gets
 # flagged as a guaranteed top strategy candidate regardless of its raw
@@ -240,7 +249,7 @@ def load_history(season, upcoming_week, schedule=None):
     player_team = {}
 
     prior_path = DATA_DIR / f"weekly_stats_{season - 1}.csv"
-    if prior_path.exists():
+    if USE_PRIOR_SEASON and prior_path.exists():
         with open(prior_path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 key = dst_key(row["team"]) if row.get("position") == "DST" else normalize_name(row["player_name"])
@@ -332,6 +341,150 @@ def load_espn_injury_status():
             key = (team_canon(row["Team"]), normalize_name(row["Name"]))
             out[key] = (row.get("InjuryStatus") or "").strip().lower()
     return out
+
+
+def load_espn_roster():
+    """
+    ESPN's full team rosters from data/espn_status_current.csv
+    (pull_espn_status.py), for the active-53 check below. Returns
+    (by_team_name, by_name, fetched_at):
+      by_team_name {(team, norm_name): row}
+      by_name      {norm_name: [row, ...]}   (to spot a player DK still
+                   lists on his old team)
+    All empty if the file doesn't exist yet.
+    """
+    path = DATA_DIR / "espn_status_current.csv"
+    by_team_name, by_name, fetched_at = {}, {}, ""
+    if not path.exists():
+        return by_team_name, by_name, fetched_at
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            nn = normalize_name(row["Name"])
+            by_team_name[(team_canon(row["Team"]), nn)] = row
+            by_name.setdefault(nn, []).append(row)
+            fetched_at = max(fetched_at, row.get("FetchedAtUtc") or "")
+    return by_team_name, by_name, fetched_at
+
+
+def roster_flag(by_team_name, by_name, team, position, norm_name):
+    """
+    Why this player is NOT on his team's active 53-man roster, or "" if he
+    is (or we can't tell). Added 2026-11-16 per Jake after week 10: the
+    optimizer used Dan Villari (LAR TE, $2,500, 0.0 proj) as a salary saver
+    while he was on the Rams practice squad, and he scored 0. A flagged
+    player is struck through on the dashboard and kept out of every
+    optimizer lineup (optimizer.py skips any row with a RosterFlag).
+
+    ESPN's /teams/{id}/roster lists the 53 plus practice squad and IR, so:
+      - StatusType practice-squad              -> "Practice Squad"
+      - InjuryStatus "Injured Reserve"         -> "IR"
+      - on a different team's roster instead   -> "Not on <team> roster (now ...)"
+      - on nobody's roster (released/FA)       -> "Not on any roster"
+    Caveat: a practice-squad player elevated for gameday does play, but DK
+    salary savers that matter are rarely those, and ESPN still shows them as
+    practice squad. Strike-through only -- override by hand if you know better.
+    """
+    if position == "DST" or not by_team_name:
+        return ""
+    row = by_team_name.get((team, norm_name))
+    if row is None:
+        elsewhere = by_name.get(norm_name, [])
+        if not elsewhere:
+            return "Not on any roster"
+        where = ", ".join(f"{r['Team']} {r['Status']}" for r in elsewhere)
+        return f"Not on {team} roster (now {where})"
+    if (row.get("StatusType") or "").strip().lower() == "practice-squad":
+        return "Practice Squad"
+    if (row.get("InjuryStatus") or "").strip().lower() == "injured reserve":
+        return "IR"
+    return ""
+
+
+# Punt check (Jake, 2026-11-16): a cheap RB/WR/TE only belongs in a lineup if
+# he is on the active 53, played more than PUNT_MIN_SNAPS offensive snaps in
+# his team's most recent game, and drew at least one target in the team's
+# last PUNT_TARGET_GAMES games. Anyone at or under PUNT_MAX_SALARY who fails
+# is struck through on the dashboard and kept out of the optimizer, the
+# same way RosterFlag players are. Snaps/targets come from nflverse
+# (pull_nflverse_usage.py) because PFF only reports snaps with a catch.
+# Week 10 check: cheap players who passed averaged 3.5 PPR pts (21 of 107
+# scored 8+); the 278 who failed averaged 0.5, and 245 of them scored 0.
+PUNT_MAX_SALARY = 4000
+PUNT_MIN_SNAPS = 10
+PUNT_TARGET_GAMES = 3
+# Teams in the top HEAVY_12_TEAMS by TE snaps per offensive play this season
+# (a proxy for 12/13 personnel -- nflverse's personnel data isn't released
+# for the current season) get a "12P" badge on their cheap tight ends.
+HEAVY_12_TEAMS = 10
+
+
+def load_nflverse_usage(season, upcoming_week):
+    """
+    From data/nflverse/ (pull_nflverse_usage.py), using only weeks before
+    upcoming_week:
+      snaps   {(team, norm_name): {week: offense_snaps}}
+      targets {(team, norm_name): {week: targets}}
+      team_weeks {team: sorted weeks the team played}
+      heavy12 {team: TE snaps per play} for the HEAVY_12_TEAMS highest
+    Returns None if the files aren't there.
+    """
+    nfv = DATA_DIR / "nflverse"
+    snap_path = nfv / f"snap_counts_{season}.csv"
+    stat_path = nfv / f"stats_player_week_{season}.csv"
+    if not snap_path.exists() or not stat_path.exists():
+        return None
+    snaps, targets, team_weeks = {}, {}, {}
+    team_plays, te_snaps = {}, {}
+    with open(snap_path, newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r.get("game_type", "REG") != "REG":
+                continue
+            wk = int(r["week"])
+            if wk >= upcoming_week:
+                continue
+            team = team_canon(r["team"])
+            s = int(float(r.get("offense_snaps") or 0))
+            team_weeks.setdefault(team, set()).add(wk)
+            team_plays[(team, wk)] = max(team_plays.get((team, wk), 0), s)
+            if r["position"] == "TE":
+                te_snaps[team] = te_snaps.get(team, 0) + s
+            snaps.setdefault((team, normalize_name(r["player"])), {})[wk] = s
+    with open(stat_path, newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r.get("season_type", "REG") != "REG":
+                continue
+            wk = int(r["week"])
+            if wk >= upcoming_week:
+                continue
+            key = (team_canon(r["team"]), normalize_name(r["player_display_name"]))
+            targets.setdefault(key, {})[wk] = int(float(r.get("targets") or 0))
+    team_weeks = {t: sorted(w) for t, w in team_weeks.items()}
+    te_rate = {t: te_snaps.get(t, 0) / max(1, sum(team_plays[(t, w)] for w in ws))
+               for t, ws in team_weeks.items()}
+    heavy12 = dict(sorted(te_rate.items(), key=lambda kv: -kv[1])[:HEAVY_12_TEAMS])
+    return {"snaps": snaps, "targets": targets, "team_weeks": team_weeks, "heavy12": heavy12}
+
+
+def punt_check(usage, team, position, norm_name, salary, inactive_reason):
+    """(snaps_last_wk, targets_recent, fail_reason). fail_reason is "" when
+    the player passes, isn't a punt (too expensive / QB / DST), or there's
+    no nflverse data to judge with."""
+    if usage is None or position not in ("RB", "WR", "TE"):
+        return "", "", ""
+    weeks = usage["team_weeks"].get(team, [])
+    if not weeks:
+        return "", "", ""
+    key = (team, norm_name)
+    snaps_last = usage["snaps"].get(key, {}).get(weeks[-1], 0)
+    tgts = sum(usage["targets"].get(key, {}).get(w, 0) for w in weeks[-PUNT_TARGET_GAMES:])
+    if salary > PUNT_MAX_SALARY or inactive_reason:
+        return snaps_last, tgts, ""
+    reasons = []
+    if snaps_last <= PUNT_MIN_SNAPS:
+        reasons.append(f"{snaps_last} snaps last game")
+    if tgts < 1:
+        reasons.append(f"no targets in last {min(PUNT_TARGET_GAMES, len(weeks))} games")
+    return snaps_last, tgts, "; ".join(reasons)
 
 
 # A backup with 0 real 2026 games gets whatever raw number the preseason
@@ -494,6 +647,23 @@ def main():
     offense_pcts, defense_pcts = build_matchup_context(args.season, args.week)
     depth_chart = load_espn_depth_chart()
     injury_status = load_espn_injury_status()
+    espn_roster, espn_by_name, espn_fetched_at = load_espn_roster()
+    if not espn_roster:
+        print("[warn] espn_status_current.csv not found -- can't check who is on an active 53-man "
+              "roster, so practice-squad/IR/released players will NOT be crossed out or kept out of "
+              "the optimizer. Run pull_espn_status.py first.")
+    else:
+        print(f"[note] active-roster check uses ESPN rosters fetched {espn_fetched_at or '(unknown time)'} "
+              f"-- re-run pull_espn_status.py if that's stale.")
+    usage = load_nflverse_usage(args.season, args.week)
+    if usage is None:
+        print("[warn] data/nflverse/ snap counts / player stats not found -- skipping the punt check "
+              "(cheap players with no snaps or targets will NOT be crossed out). "
+              "Run pull_nflverse_usage.py first.")
+    else:
+        print(f"[note] punt check: nflverse snaps/targets through week "
+              f"{max((w[-1] for w in usage['team_weeks'].values()), default='?')}; heavy-12 teams: "
+              f"{', '.join(usage['heavy12'])}")
     if not depth_chart or not injury_status:
         print("[note] espn_depthchart_current.csv / espn_status_current.csv not found (or empty) -- "
               "skipping the healthy-backup discount check (run pull_espn_depthchart.py / "
@@ -563,9 +733,39 @@ def main():
 
         value = round(projection / (p["salary"] / 1000), 3) if p["salary"] else 0
 
+        # Upside140: the "chase 140+" build (2026-11-04 backtest, weeks 2-8):
+        # 2-game EWMA over every 2026 game + 1.5 x the 2026 stdev, paired in
+        # the optimizer with a QB + 2 WR/TE stack. With no 2026 games, fall
+        # back to 70% of Projection; with fewer than 2, assume stdev = 60% of
+        # the mean.
+        pts_2026 = [pt for _, pt in games_2026]
+        if pts_2026:
+            alpha = 2 / (UPSIDE_EWMA_SPAN + 1)
+            upside_mu = pts_2026[0]
+            for pt in pts_2026[1:]:
+                upside_mu = alpha * pt + (1 - alpha) * upside_mu
+        else:
+            upside_mu = 0.7 * projection
+        if len(pts_2026) >= 2:
+            m = sum(pts_2026) / len(pts_2026)
+            upside_sd = (sum((x - m) ** 2 for x in pts_2026) / (len(pts_2026) - 1)) ** 0.5
+        else:
+            upside_sd = 0.6 * upside_mu
+        upside140 = round(max(0.0, upside_mu + UPSIDE_SD_WEIGHT * upside_sd), 2)
+
         # Floor: only meaningful with >= 3 games of history; below that the
         # sample stdev is too noisy to call it a "floor" with any confidence.
         floor_val = floor if (floor is not None and n_games >= 3 and n_2026 >= 1) else ""
+
+        inactive_reason = roster_flag(espn_roster, espn_by_name, team_canon(p["team"]),
+                                      p["position"], p["norm_name"])
+        if inactive_reason:
+            notes = f"[NOT ACTIVE: {inactive_reason} -- excluded from optimizer] " + notes
+        snaps_last_wk, targets_recent, punt_fail = punt_check(
+            usage, team_canon(p["team"]), p["position"], p["norm_name"], p["salary"], inactive_reason)
+        if punt_fail:
+            notes = f"[PUNT FAIL: {punt_fail} -- excluded from optimizer] " + notes
+        heavy12 = bool(usage) and p["position"] == "TE" and team_canon(p["team"]) in usage["heavy12"]
 
         # Surface injury/news signal in Notes too so it's visible even when
         # a column-blind view (like a quick CSV skim) is all someone checks.
@@ -658,12 +858,18 @@ def main():
             "StdDev": stdev if stdev is not None else "",
             "Status": p.get("status", ""),
             "DraftAlerts": p.get("draft_alerts", ""),
+            "RosterFlag": inactive_reason,
+            "PuntFail": punt_fail,
+            "SnapsLastWk": snaps_last_wk,
+            "TargetsRecent": targets_recent,
+            "Heavy12": heavy12,
             "MatchupScore": matchup_score if matchup_score is not None else "",
             "MatchupLabel": matchup_label if matchup_label is not None else "",
             "Games2026": n_2026,
             "EwmaProjection": ewma_projection,
             "EwmaValue": ewma_value,
             "EwmaNotes": ewma_notes,
+            "Upside140": upside140,
             "FadeTarget": fade_target,
             "PtsLastWk": pts_last_wk,
             "PtsAvg3": pts_avg3,
@@ -687,6 +893,17 @@ def main():
         print(f"[note] {no_history} players had no PFF history match "
               f"(new to league, name-matching miss, or bye-week team). "
               f"Check the Notes column.")
+
+    inactive = [r for r in out_rows if r["RosterFlag"]]
+    if inactive:
+        cheap = sorted((r for r in inactive if r["Salary"] <= 4000), key=lambda r: r["Salary"])
+        print(f"[note] {len(inactive)} player(s) are not on an active 53-man roster (practice squad, IR, "
+              f"or released) -- crossed out on the dashboard and excluded from the optimizer. "
+              f"{len(cheap)} of them are $4,000 or less.")
+    punt_fails = [r for r in out_rows if r["PuntFail"]]
+    if punt_fails:
+        print(f"[note] {len(punt_fails)} active RB/WR/TE at ${PUNT_MAX_SALARY:,} or less failed the punt check "
+              f"(<= {PUNT_MIN_SNAPS} snaps last game or no recent target) -- crossed out and excluded too.")
 
     real_ewma = sum(1 for r in out_rows if r["Games2026"] >= EWMA_SPAN)
     print(f"[note] EWMA (2026, {EWMA_SPAN}-game lookback): {real_ewma} player(s) have "

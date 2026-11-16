@@ -65,6 +65,10 @@
   .strategy-empty { font-size:12px; color:var(--muted); font-style:italic; }
   .status-badge { display:inline-block; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:700; margin-left:4px; background:var(--warn); color:#1a1400; }
   .status-badge.out { background:var(--bad); color:#fff; }
+  /* Not on an active 53-man roster (practice squad / IR / released): struck through. */
+  tr.inactive-row td { text-decoration: line-through; opacity: 0.5; }
+  tr.inactive-row td:first-child, tr.inactive-row .status-badge { text-decoration: none; }
+  .lineup-slot.inactive { text-decoration: line-through; opacity: 0.6; }
   input[type=checkbox] { accent-color: var(--accent); }
   label.checkbox-label { display:flex; align-items:center; gap:5px; font-size:13px; color:var(--muted); }
   .matchup-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
@@ -96,6 +100,7 @@
   <label class="small" for="projMode" style="color:var(--muted);">Projection model:</label>
   <select id="projMode">
     <option value="safe" selected>Safe: Floor + QB stack (best in backtest)</option>
+    <option value="upside">Upside 140: 2026 EWMA + QB+2 stack</option>
     <option value="ewma">EWMA (2026 only, 5-game lookback)</option>
     <option value="blend">Season Blend (recency-weighted, incl. 2025)</option>
   </select>
@@ -199,6 +204,10 @@ function applyProjectionMode() {
       p.activeProjection = p.floor != null ? p.floor : 0;
       p.activeValue = p.salary ? p.activeProjection / (p.salary / 1000) : 0;
       p.activeNotes = p.notes || "";
+    } else if (projectionMode === "upside") {
+      p.activeProjection = p.upside140 != null ? p.upside140 : 0;
+      p.activeValue = p.salary ? p.activeProjection / (p.salary / 1000) : 0;
+      p.activeNotes = p.notes || "";
     } else if (projectionMode === "ewma") {
       p.activeProjection = p.ewmaProjection != null ? p.ewmaProjection : p.projection;
       p.activeValue = p.ewmaValue != null ? p.ewmaValue : p.value;
@@ -211,12 +220,16 @@ function applyProjectionMode() {
   });
   optimizerLineups = projectionMode === "safe"
     ? (DASHBOARD_DATA.optimizerLineupsSafe || [])
+    : projectionMode === "upside"
+    ? (DASHBOARD_DATA.optimizerLineupsUpside || [])
     : projectionMode === "ewma"
     ? (DASHBOARD_DATA.optimizerLineupsEwma || [])
     : (DASHBOARD_DATA.optimizerLineups || []);
   const hint = document.getElementById("projModeHint");
   if (hint) hint.textContent = projectionMode === "safe"
     ? "Proj = Floor (a bad-day outcome); optimizer lineups also stack the QB with 1+ of his WR/TE. Steadiest angle in the 2026 wk1-6 backtest."
+    : projectionMode === "upside"
+    ? "Proj = 2-game 2026 EWMA + 1.5 x 2026 std dev (an upside number, not a forecast); optimizer lineups stack the QB with 2+ of his WR/TE. Built to chase 140+."
     : projectionMode === "ewma"
     ? "* = fewer than 5 games of 2026 data -- showing a placeholder (preseason projection or DK average) instead of a real EWMA."
     : "";
@@ -261,14 +274,37 @@ document.querySelectorAll(".tab").forEach(t => {
 // build_projections.py, so anything reaching here with a status is a
 // still-playing designation worth a glance (Q/D/GTD/etc), not an exclusion.
 function isFlagged(p) {
-  return !!(p.status || p.draftAlerts);
+  return !!(p.status || p.draftAlerts || p.rosterFlag);
+}
+
+// Not on an active 53-man roster (build_projections.py RosterFlag: practice
+// squad, IR, or released). Already kept out of every optimizer lineup.
+// Also covers a failed punt (PuntFail): a cheap RB/WR/TE with <= 10 snaps
+// last game or no target in his team's last 3 games.
+function isInactive(p) { return !!(p.rosterFlag || p.puntFail); }
+
+function inactiveBadgeHtml(p) {
+  if (!p.rosterFlag && p.puntFail) {
+    return `<span class="status-badge out" title="Failed the punt check: ${p.puntFail.replace(/"/g, "&quot;")}. Excluded from the optimizer.">NO USAGE</span>`;
+  }
+  const f = p.rosterFlag || "";
+  const label = f === "Practice Squad" ? "PS" : f === "IR" ? "IR" : "NOT ON ROSTER";
+  const title = `Not on an active 53-man roster: ${f}. Excluded from the optimizer.`;
+  return `<span class="status-badge out" title="${title.replace(/"/g, "&quot;")}">${label}</span>`;
+}
+
+// Cheap TE who passed the punt check on a heavy 12-personnel team.
+function heavy12BadgeHtml(p) {
+  if (!p.heavy12 || isInactive(p) || p.salary > 4000) return "";
+  return `<span class="status-badge" style="background:var(--good); color:#08150e;" title="Team is top 10 in TE snaps per play (heavy 12 personnel). ${p.snapsLastWk ?? "?"} snaps last game, ${p.targetsRecent ?? "?"} targets in last 3.">12P</span>`;
 }
 
 function statusBadgeHtml(p) {
-  if (!isFlagged(p)) return "";
+  if (isInactive(p)) return inactiveBadgeHtml(p);
+  if (!isFlagged(p)) return heavy12BadgeHtml(p);
   const label = p.status || "flag";
   const title = [p.status, p.draftAlerts].filter(Boolean).join(" / ");
-  return `<span class="status-badge" title="${title.replace(/"/g, "&quot;")}">${label}</span>`;
+  return `<span class="status-badge" title="${title.replace(/"/g, "&quot;")}">${label}</span>` + heavy12BadgeHtml(p);
 }
 
 // DIY approximation of PFF's matchup chart -- see scripts/matchup_score.py
@@ -338,6 +374,7 @@ function renderTable() {
   tbody.innerHTML = "";
   for (const p of rows) {
     const tr = document.createElement("tr");
+    if (isInactive(p)) tr.className = "inactive-row";
     const valueClass = p.activeValue >= 3 ? "value-hi" : "value-lo";
     const isPlaceholder = projectionMode === "ewma" && (p.games2026 || 0) < 5;
     const fmtCell = v => (v != null) ? v.toFixed(2) : "&mdash;";
@@ -399,7 +436,7 @@ function renderLineup() {
     const p = lineup[i];
     if (p) { salaryUsed += p.salary; projTotal += p.activeProjection; }
     const row = document.createElement("div");
-    row.className = "lineup-slot";
+    row.className = "lineup-slot" + (p && isInactive(p) ? " inactive" : "");
     row.innerHTML = p
       ? `<span><span class="pos pos-${p.position}">${slotDef.slot}</span> ${p.name}${statusBadgeHtml(p)} <span class="small">${p.team}</span></span>
          <span>$${p.salary.toLocaleString()} &middot; ${p.activeProjection.toFixed(1)}pt
@@ -595,13 +632,15 @@ const BASE_COLUMNS = [
     title: "DIY approximation of PFF's matchup chart (scripts\\matchup_score.py): how favorable this position's matchup is against the upcoming opponent (Great/Fair/Poor, scored 1-5). Click to sort by score." },
   { id: "salary", label: "Salary", sortable: true, getValue: p => p.salary,
     title: "This week's DraftKings salary." },
-  { id: "proj", label: () => projectionMode === "safe" ? "Floor" : projectionMode === "ewma" ? "Proj (EWMA)" : "Proj", sortable: true, getValue: p => p.activeProjection,
-    title: () => projectionMode === "safe"
+  { id: "proj", label: () => projectionMode === "safe" ? "Floor" : projectionMode === "upside" ? "Upside" : projectionMode === "ewma" ? "Proj (EWMA)" : "Proj", sortable: true, getValue: p => p.activeProjection,
+    title: () => projectionMode === "upside"
+      ? "Upside -- 2-game EWMA of 2026 DK points plus 1.5 x their 2026 standard deviation."
+      : projectionMode === "safe"
       ? "Floor -- a bad-day DK points outcome from the season blend model. Blank floors (no history) count as 0."
       : projectionMode === "ewma"
       ? "Projected DK points -- EWMA model (weighted average of the last 5 2026 games only, no 2025 history)."
       : "Projected DK points -- season blend model (recency-weighted average including 2025 history)." },
-  { id: "value", label: () => projectionMode === "safe" ? "Value (Floor)" : projectionMode === "ewma" ? "Value (EWMA)" : "Value", sortable: true, getValue: p => p.activeValue,
+  { id: "value", label: () => projectionMode === "safe" ? "Value (Floor)" : projectionMode === "upside" ? "Value (Upside)" : projectionMode === "ewma" ? "Value (EWMA)" : "Value", sortable: true, getValue: p => p.activeValue,
     title: "Value = active-model Projection \u00f7 Salary \u00d7 1000 -- projected points per $1,000 of salary. Higher means more points per dollar." },
   { id: "ptsLastWk", label: "Last Wk", sortable: true, getValue: p => p.ptsLastWk,
     title: "This player's (or DST's) own actual DK points in their most recent completed game, 2026 only." },
@@ -642,6 +681,15 @@ const ogOptimizerCounts = new Map();
   ogOptimizerCounts.set(name, (ogOptimizerCounts.get(name) || 0) + 1);
 }));
 const SCREENS = [
+  {
+    key: "punt_usage",
+    label: "Playable Punts (Snaps + Targets)",
+    hint: "RB/WR/TE at $4,000 or less who passed the punt check: on the active 53, more than 10 offensive snaps in his team's last game, and 1+ target in the last 3 (nflverse data). Tight ends on heavy 12-personnel teams (top 10 in TE snaps per play) rank first, then by recent targets. Top 10 per position.",
+    filter: p => ["RB", "WR", "TE"].includes(p.position) && p.salary <= 4000 && p.snapsLastWk != null && p.snapsLastWk > 10 && (p.targetsRecent || 0) >= 1,
+    compare: (a, b) => (Number(b.heavy12) - Number(a.heavy12)) || ((b.targetsRecent || 0) - (a.targetsRecent || 0)) || ((b.snapsLastWk || 0) - (a.snapsLastWk || 0)),
+    stat: p => `${p.snapsLastWk} snaps, ${p.targetsRecent} tgt L3${p.heavy12 ? ", 12P" : ""}`,
+    sortValue: p => (p.heavy12 ? 1000 : 0) + (p.targetsRecent || 0),
+  },
   {
     key: "value_gap",
     label: "Model Likes It, Still Priced Cheap",
@@ -703,7 +751,8 @@ const SCREENS = [
 function computeScreenMembership(screen) {
   const map = new Map();
   const byPos = {};
-  players.filter(screen.filter).forEach(p => {
+  // Inactive (practice squad / IR / released) players never count toward a screen's top 10.
+  players.filter(p => !isInactive(p) && screen.filter(p)).forEach(p => {
     (byPos[p.position] = byPos[p.position] || []).push(p);
   });
   Object.values(byPos).forEach(group => {

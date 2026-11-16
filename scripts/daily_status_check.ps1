@@ -92,6 +92,11 @@ if ($LASTEXITCODE -ne 0) {
     Log "WARNING: pull_espn_depthchart.py failed -- continuing without it."
 }
 
+& $py "$root\scripts\pull_nflverse_usage.py" --season $Season 2>&1 | ForEach-Object { Log "  $_" }
+if ($LASTEXITCODE -ne 0) {
+    Log "WARNING: pull_nflverse_usage.py failed -- the punt check will use the last download (or be skipped)."
+}
+
 Log "Rebuilding projections + dashboard with today's data..."
 & $py "$root\scripts\build_projections.py" --season $Season --week $Week --salaries $salariesPath 2>&1 | ForEach-Object { Log "  $_" }
 if ($LASTEXITCODE -ne 0) {
